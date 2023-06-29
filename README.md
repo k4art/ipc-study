@@ -1,10 +1,9 @@
 # Inter-Process Communication (Linux)
 
 ## Methods
-[x] *File*                   *FS*        - open/write/read
-[x] *Signal*                 *No Data*   - signal/kill
-[ ] *Socket*                 *Network*   - AF_INET/UNIX, SOCK_STREAM/DGRAM
-[ ] *Message Queue*          *Messages*  - mq_overview
-[ ] *Pipe*                   *Channel*   - pipe/mkfifo
-[ ] *Shared Memory*          *Memory*    - shm_open/mmap
-[ ] *dbus*                   *Messages*
+- [x] *File*              - open/write/read
+- [x] *Signal*            - signal/kill
+- [ ] *Socket*            - AF_INET/UNIX, SOCK_STREAM/DGRAM
+- [ ] *Message Queue*     - mq_overview
+- [ ] *Pipe*              - pipe/mkfifo
+- [x] *Shared Memory*     - shm_open/mmap
