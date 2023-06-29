@@ -5,8 +5,8 @@
 
 typedef enum
 {
-	IPC_CHANNEL_FLAVOR_MMAP,
-	IPC_CHANNEL_FLAVOR_SOCKET,
+  IPC_CHANNEL_FLAVOR_MMAP,
+  IPC_CHANNEL_FLAVOR_SOCKET,
 } ipc_channel_flavors_t;
 
 typedef void (* ipc_channel_push)(void * self, const void * buffer);
@@ -22,6 +22,6 @@ typedef struct
 
 ipc_channel_api_t * ipc_channel_create(const char            * key,
                                        size_t                  unit_size,
-	                                     ipc_channel_flavors_t   flavor);
+                                       ipc_channel_flavors_t   flavor);
 
 #endif
