@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <stdalign.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,9 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "channels/psync/mutex.h"
+#include "channels/psync/cv.h"
 
 #include "channels/channel.h"
 
@@ -20,15 +24,16 @@
 
 typedef struct
 {
-  atomic_uint     init_spinlock;  // `shm_open` is followed by `ftruncate`
-                                  // which zero-fills empty file on first init
-                                  // so that init_spinlock become 0
-  atomic_uint     ref_count;
-  pthread_mutex_t mutex;
-  pthread_cond_t  cv_not_full;
-  pthread_cond_t  cv_not_empty;
-  size_t          head;
-  size_t          tail;
+  // These two atomics synchronize initialization and destruction
+  // of the shared memory
+  atomic_uint  init_spinlock;
+  atomic_uint  ref_count;
+
+  ipc_mutex_t  mutex;
+  ipc_cv_t     cv_not_full;
+  ipc_cv_t     cv_not_empty;
+  size_t       head;
+  size_t       tail;
 
   __attribute__ ((aligned(alignof(max_align_t))))
   char     data[];
@@ -38,53 +43,83 @@ typedef struct
 {
   ipc_channel_api_t           api;
   const char                * name;
-  ipc_channel_mmap_shared_t * inner;
+  ipc_channel_mmap_shared_t * shared;
   size_t                      unit_size;
 } ipc_channel_mmap_t;
 
 static_assert(offsetof(ipc_channel_mmap_t, api) == 0,
               "Channel struct must has `api` the first field");
 
+static size_t real_capacity(const ipc_channel_mmap_t * ipc)
+{
+  return CAPACITY - CAPACITY % ipc->unit_size;
+}
+
+static size_t next_index_index(const ipc_channel_mmap_t * ipc, size_t from_idx)
+{
+  size_t capacity = real_capacity(ipc);
+  return (from_idx + ipc->unit_size) % capacity;
+}
+
+static size_t next_index_head(const ipc_channel_mmap_t * ipc)
+{
+  return next_index_index(ipc, ipc->shared->head);
+}
+
+static size_t next_index_tail(const ipc_channel_mmap_t * ipc)
+{
+  return next_index_index(ipc, ipc->shared->tail);
+}
+
+static bool is_empty(const ipc_channel_mmap_t * ipc)
+{
+  return ipc->shared->head == ipc->shared->tail;
+}
+
+static bool is_full(const ipc_channel_mmap_t * ipc)
+{
+  size_t next_tail = next_index_tail(ipc);
+
+  return ipc->shared->head == next_tail;
+}
+
 static void push(void * self, const void * buffer)
 {
   ipc_channel_mmap_t * ipc = self;
 
-  pthread_mutex_lock(&ipc->inner->mutex);
+  IPC_CRITICAL_SECTION(&ipc->shared->mutex)
   {
-    size_t capacity = CAPACITY - CAPACITY % ipc->unit_size;
-    size_t next_tail = (ipc->inner->tail + ipc->unit_size) % capacity;
+    size_t capacity = real_capacity(ipc);
 
-    while (ipc->inner->head == next_tail)
+    while (is_full(ipc))
     {
-      pthread_cond_wait(&ipc->inner->cv_not_full, &ipc->inner->mutex);
+      ipc_cv_wait(&ipc->shared->cv_not_full, &ipc->shared->mutex);
     }
     
-    memcpy(&ipc->inner->data[ipc->inner->tail], buffer, ipc->unit_size);
-    ipc->inner->tail = next_tail;
+    memcpy(&ipc->shared->data[ipc->shared->tail], buffer, ipc->unit_size);
+    ipc->shared->tail = next_index_tail(ipc);
 
-    pthread_cond_signal(&ipc->inner->cv_not_empty);
+    ipc_cv_notify_one(&ipc->shared->cv_not_empty);
   }
-  pthread_mutex_unlock(&ipc->inner->mutex);
 }
 
 static void pop(void * self, void * buffer)
 {
   ipc_channel_mmap_t * ipc = self;
-  size_t capacity = CAPACITY - CAPACITY % ipc->unit_size;
+  size_t capacity = real_capacity(ipc);
 
-  pthread_mutex_lock(&ipc->inner->mutex);
+  IPC_CRITICAL_SECTION(&ipc->shared->mutex)
   {
-    while (ipc->inner->head == ipc->inner->tail)
+    while (is_empty(ipc))
     {
-      pthread_cond_wait(&ipc->inner->cv_not_empty, &ipc->inner->mutex);
+      ipc_cv_wait(&ipc->shared->cv_not_empty, &ipc->shared->mutex);
     }
     
-    memcpy(buffer, &ipc->inner->data[ipc->inner->head], ipc->unit_size);
-    ipc->inner->head = (ipc->inner->head + ipc->unit_size) % capacity;
+    memcpy(buffer, &ipc->shared->data[ipc->shared->head], ipc->unit_size);
+    ipc->shared->head = next_index_head(ipc);
 
-    pthread_cond_signal(&ipc->inner->cv_not_full);
+    ipc_cv_notify_one(&ipc->shared->cv_not_full);
   }
-  pthread_mutex_unlock(&ipc->inner->mutex);
 }
 
 static void mmap_shared_destroy(ipc_channel_mmap_shared_t * shared);
@@ -93,7 +128,7 @@ static void destroy(void * self)
   ipc_channel_mmap_t * ipc = self;
   if (ipc)
   {
-    mmap_shared_destroy(ipc->inner);
+    mmap_shared_destroy(ipc->shared);
     shm_unlink(ipc->name);
     free(ipc);
   }
@@ -103,6 +138,7 @@ static void * execute_mmap(const char * name)
 {
   int shm = shm_open(name, O_CREAT|O_RDWR, 0600);
   void * mem = NULL;
+
   if (shm < 0) return NULL;
 
   if (ftruncate(shm, MMAP_SIZE))
@@ -118,9 +154,6 @@ exit:
   return mem;
 }
 
-static int init_pshared_mutex(pthread_mutex_t * mutex);
-static int init_pshared_cond(pthread_cond_t * cond);
-
 static int mmap_shared_create(void * shared_mem)
 {
   int ret = 0;
@@ -132,24 +165,23 @@ static int mmap_shared_create(void * shared_mem)
     sched_yield();
   }
 
-  if (atomic_load(&shared->ref_count) > 0)
+  if (atomic_fetch_add_explicit(&shared->ref_count, 1, memory_order_acq_rel) > 0)
   {
     // the shared memory is already initialized
     goto exit;
   }
 
-  if ((ret = init_pshared_mutex(&shared->mutex)))
+  if ((ret = ipc_mutex_init(&shared->mutex)))
     goto exit;
 
-  if ((ret = init_pshared_cond(&shared->cv_not_empty)))
+  if ((ret = ipc_cv_init(&shared->cv_not_empty)))
     goto exit;
 
-  if ((ret = init_pshared_cond(&shared->cv_not_full)))
+  if ((ret = ipc_cv_init(&shared->cv_not_full)))
     goto exit;
 
   shared->head = 0;
   shared->tail = 0;
-  shared->ref_count++;
 
 exit:
   shared->init_spinlock = 0;
@@ -159,7 +191,7 @@ exit:
 ipc_channel_api_t * ipc_channel_mmap_create(const char * name, size_t unit_size)
 {
   ipc_channel_mmap_t * ipc = NULL;
-  void * shared_mem = NULL;
+  void * shared_mem = (void *) -1;
 
   if (__builtin_popcount(unit_size) != 1)
     goto failure;
@@ -175,7 +207,7 @@ ipc_channel_api_t * ipc_channel_mmap_create(const char * name, size_t unit_size)
 
   ipc->name = name; // ISSUE: implicit static lifetime assumption
 
-  ipc->inner = shared_mem;
+  ipc->shared = shared_mem;
   ipc->unit_size = unit_size;
   ipc->api.push = push;
   ipc->api.pop = pop;
@@ -202,48 +234,10 @@ static void mmap_shared_destroy(ipc_channel_mmap_shared_t * shared)
     // the last holder of the shared memory
     // must release collected there resources
     
-    pthread_mutex_destroy(&shared->mutex);
-    pthread_cond_destroy(&shared->cv_not_empty);
-    pthread_cond_destroy(&shared->cv_not_full);
+    ipc_mutex_destroy(&shared->mutex);
+    ipc_cv_destroy(&shared->cv_not_empty);
+    ipc_cv_destroy(&shared->cv_not_full);
   }
 
   munmap(shared, MMAP_SIZE);
-}
-
-static int init_pshared_mutex(pthread_mutex_t * mutex)
-{
-  int ret = 0;
-  pthread_mutexattr_t mutexattr;
-
-  if ((ret = pthread_mutexattr_init(&mutexattr)))
-    return ret;
-
-  if ((ret = pthread_mutexattr_setpshared(&mutexattr, PTHREAD_PROCESS_SHARED)))
-    goto exit;
-
-  if ((ret = pthread_mutex_init(mutex, &mutexattr)))
-    goto exit;
-
-exit:
-  pthread_mutexattr_destroy(&mutexattr);
-  return ret;
-}
-
-static int init_pshared_cond(pthread_cond_t * cond)
-{
-  int ret = 0;
-  pthread_condattr_t condattr;
-
-  if ((ret = pthread_condattr_init(&condattr)))
-    return ret;
-
-  if ((ret = pthread_condattr_setpshared(&condattr, PTHREAD_PROCESS_SHARED)))
-    goto exit;
-
-  if ((ret = pthread_cond_init(cond, &condattr)))
-    goto exit;
-
-exit:
-  pthread_condattr_destroy(&condattr);
-  return ret;
 }

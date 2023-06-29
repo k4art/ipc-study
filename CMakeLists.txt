@@ -12,6 +12,8 @@ include_directories(.)
 add_library(ipcmmap STATIC ./channels/flavors/mmap.c
                            ./channels/flavors/socket.c
                            ./channels/channel.c
+                           ./channels/psync/mutex.c
+                           ./channels/psync/cv.c
 )
 
 add_executable(bench ./benchmarks/channel.bench.c)
