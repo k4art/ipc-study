@@ -8,6 +8,12 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -fno-omit-frame-pointer -fsanitize=address -fno-sanitize-recover=all")
 set(CMAKE_LINKER_FLAGS_DEBUG "${CMAKE_LINKER_FLAGS_DEBUG} -fno-omit-frame-pointer -fsanitize=address -fno-sanitize-recover=all")
 
+option(USE_SPSC_MMAP "Use SPSC mmap version that is synchronized via atomics" OFF)
+
+if (USE_SPSC_MMAP)
+  add_compile_definitions(USE_SPSC_MMAP)
+endif (USE_SPSC_MMAP)
+
 include_directories(.)
 add_library(ipcmmap STATIC ./channels/flavors/mmap.c
                            ./channels/flavors/socket.c

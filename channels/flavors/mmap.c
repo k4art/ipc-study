@@ -29,6 +29,7 @@ typedef struct
   atomic_uint  init_spinlock;
   atomic_uint  ref_count;
 
+#ifndef USE_SPSC_MMAP
   ipc_mutex_t  mutex;
   ipc_cv_t     cv_not_full;
   ipc_cv_t     cv_not_empty;
@@ -37,6 +38,17 @@ typedef struct
 
   __attribute__ ((aligned(alignof(max_align_t))))
   char     data[];
+#else
+  __attribute__ ((aligned(128)))
+  atomic_size_t head;
+
+  __attribute__ ((aligned(128)))
+  atomic_size_t tail;
+
+  // assuming 128 is more strict then alignof(max_allign_t)
+  __attribute__ ((aligned(128)))
+  char     data[];
+#endif
 } ipc_channel_mmap_shared_t;
 
 typedef struct
@@ -87,6 +99,7 @@ static void push(void * self, const void * buffer)
 {
   ipc_channel_mmap_t * ipc = self;
 
+#ifndef USE_SPSC_MMAP
   IPC_CRITICAL_SECTION(&ipc->shared->mutex)
   {
     size_t capacity = real_capacity(ipc);
@@ -101,6 +114,16 @@ static void push(void * self, const void * buffer)
 
     ipc_cv_notify_one(&ipc->shared->cv_not_empty);
   }
+#else
+  while (is_full(ipc))
+    sched_yield();
+
+  memcpy(&ipc->shared->data[ipc->shared->tail], buffer, ipc->unit_size);
+
+  // SAFETY: this is not atomic update, but it's okey,
+  //         because it is the only consumer
+  ipc->shared->tail = next_index_tail(ipc);
+#endif
 }
 
 static void pop(void * self, void * buffer)
@@ -108,6 +131,7 @@ static void pop(void * self, void * buffer)
   ipc_channel_mmap_t * ipc = self;
   size_t capacity = real_capacity(ipc);
 
+#ifndef USE_SPSC_MMAP
   IPC_CRITICAL_SECTION(&ipc->shared->mutex)
   {
     while (is_empty(ipc))
@@ -120,6 +144,16 @@ static void pop(void * self, void * buffer)
 
     ipc_cv_notify_one(&ipc->shared->cv_not_full);
   }
+#else
+  while (is_empty(ipc))
+    sched_yield();
+
+  memcpy(buffer, &ipc->shared->data[ipc->shared->head], ipc->unit_size);
+
+  // SAFETY: this is not atomic update, but it's okey,
+  //         because it is the only consumer
+  ipc->shared->head = next_index_head(ipc);
+#endif
 }
 
 static void mmap_shared_destroy(ipc_channel_mmap_shared_t * shared);
@@ -171,6 +205,7 @@ static int mmap_shared_create(void * shared_mem)
     goto exit;
   }
 
+#ifndef USE_SPSC_MMAP
   if ((ret = ipc_mutex_init(&shared->mutex)))
     goto exit;
 
@@ -179,6 +214,7 @@ static int mmap_shared_create(void * shared_mem)
 
   if ((ret = ipc_cv_init(&shared->cv_not_full)))
     goto exit;
+#endif
 
   shared->head = 0;
   shared->tail = 0;
@@ -234,9 +270,11 @@ static void mmap_shared_destroy(ipc_channel_mmap_shared_t * shared)
     // the last holder of the shared memory
     // must release collected there resources
     
+#ifndef USE_SPSC_MMAP
     ipc_mutex_destroy(&shared->mutex);
     ipc_cv_destroy(&shared->cv_not_empty);
     ipc_cv_destroy(&shared->cv_not_full);
+#endif
   }
 
   munmap(shared, MMAP_SIZE);
