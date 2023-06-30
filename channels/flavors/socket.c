@@ -23,15 +23,31 @@ static_assert(offsetof(ipc_channel_socket_t, api) == 0,
 static void push(void * self, const void * buffer)
 {
   ipc_channel_socket_t * ipc = self;
-  int ret = send(ipc->conn_sockfd, buffer, ipc->unit_size, 0);
-  assert(ret > 0);
+  size_t bytes_left = ipc->unit_size;
+  const char * buf_ptr = buffer;
+  ssize_t ret = 0;
+
+  while (bytes_left > 0 && ret >= 0)
+  {
+    ret = send(ipc->conn_sockfd, buf_ptr, bytes_left, 0);
+    buf_ptr += ret;
+    bytes_left -= ret;
+  }
 }
 
 static void pop(void * self, void * buffer)
 {
   ipc_channel_socket_t * ipc = self;
-  int ret = recv(ipc->conn_sockfd, buffer, ipc->unit_size, 0);
-  assert(ret > 0);
+  size_t bytes_left = ipc->unit_size;
+  char * buf_ptr = buffer;
+  ssize_t ret = 0;
+
+  while (bytes_left > 0 && ret >= 0)
+  {
+    ret = recv(ipc->conn_sockfd, buf_ptr, bytes_left, 0);
+    buf_ptr += ret;
+    bytes_left -= ret;
+  }
 }
 
 static void destroy(void * self)
